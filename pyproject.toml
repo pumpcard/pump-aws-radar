@@ -41,8 +41,8 @@ dev = [
 ]
 
 [project.urls]
-Homepage   = "https://github.com/meku-pump/pump-aws-radar"
-Repository = "https://github.com/meku-pump/pump-aws-radar"
+Homepage   = "https://github.com/pumpcard/pump-aws-radar"
+Repository = "https://github.com/pumpcard/pump-aws-radar"
 Upstream   = "https://github.com/gomorsmi/aws-radar"
 
 [project.scripts]
