@@ -36,6 +36,7 @@ dependencies = [
 [project.optional-dependencies]
 dev = [
   "pytest>=7.0",
+  "moto[organizations,ram,cloudformation,cloudtrail,iam,s3,ssoadmin,identitystore,config]>=5",
   "build",
   "twine",
 ]

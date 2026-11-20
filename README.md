@@ -47,6 +47,43 @@ pump-aws-radar run --billing --upload-token <TOKEN> --api-base http://localhost:
 PUMP_API_BASE=http://localhost:8001 pump-aws-radar run --billing --upload-token <TOKEN>
 ```
 
+## Organization migration checks
+
+Checks what breaks if the organization's accounts move to another AWS Organization.
+Run it from the **management account**:
+
+```bash
+pump-aws-radar org-checks --profile <management-account-profile>
+# or as part of a full run
+pump-aws-radar run --all-regions --tags --billing --org-checks --upload-token <TOKEN>
+```
+
+It writes `org_checks.csv` (one row per finding: Severity, Service, Check, AccountID, Region,
+Resource, Detail, Action) and prints a verdict:
+
+| Found | Verdict |
+|---|---|
+| any `blocker` (e.g. Control Tower) | CTA onboarding — route to sales |
+| Control Tower or the org could not be read | Undecided — rerun with the permissions below |
+| `fix_before_move` or `review` rows | Regular onboarding after prep |
+| only `reenable_after_move` rows | Regular onboarding; turn those back on in the new org |
+
+### Permissions
+
+Everything is read-only. The AWS-managed `ReadOnlyAccess` policy covers every call except
+Control Tower's. Add these two actions so the landing zone can be read directly:
+
+```json
+{"Effect": "Allow", "Action": ["controltower:ListLandingZones", "controltower:GetLandingZone"], "Resource": "*"}
+```
+
+Without them the scan still flags Control Tower from its IAM roles and its `AWSControlTowerBP-*`
+stack sets, and adds an unverified row for the landing zone.
+
+Member accounts are only scanned through an organization-wide AWS Config aggregator, if one
+exists in the management account. Everything the scan does not cover is listed in a
+`not covered` row in the CSV.
+
 ## How the push works
 
 `pump_aws_radar/upload.py`:

@@ -59,6 +59,20 @@ def main():
     bil.add_argument("--include-zero", action="store_true", help="Keep service/day buckets with zero cost")
     bil.add_argument("--output",  metavar="FILE.csv", default="billing.csv", help="CSV output path (default: billing.csv)")
 
+    # ── org-checks sub-command ──
+    org = sub.add_parser(
+        "org-checks",
+        help="Check what breaks if the org's accounts move to another AWS Organization (run from the management account)",
+    )
+    org.add_argument("--profile", default=None, help="AWS SSO/named profile")
+    org.add_argument("--region", action="append", default=None,
+                     help="Limit regional checks to this region (repeatable; default: all enabled regions)")
+    org.add_argument("--output", metavar="FILE.csv", default="org_checks.csv",
+                     help="CSV output path (default: org_checks.csv)")
+    org.add_argument("--upload-token", default=None, help="Pump upload token: also push the CSV to Pump")
+    org.add_argument("--api-base", default=DEFAULT_API_BASE,
+                     help=f"Pump API base for --upload-token (default: {DEFAULT_API_BASE}; or set PUMP_API_BASE)")
+
     # ── diagram sub-command ──
     dia = sub.add_parser("diagram", help="Generate draw.io diagram from inventory CSV")
     dia.add_argument("--input",  required=True,          help="CSV produced by 'inventory'")
@@ -81,6 +95,10 @@ def main():
     run.add_argument("--billing-metric", default=None, choices=METRICS, help="Cost Explorer metric (default: UnblendedCost)")
     run.add_argument("--billing-output", metavar="FILE.csv", default=None, help="Billing CSV path (default: billing.csv)")
     run.add_argument("--include-zero", action="store_true", help="Keep zero-cost service/day buckets in the billing CSV")
+    run.add_argument("--org-checks", action="store_true",
+                     help="Also run the organization migration checks (needs management-account credentials)")
+    run.add_argument("--org-checks-output", metavar="FILE.csv", default="org_checks.csv",
+                     help="Org checks CSV path (default: org_checks.csv)")
     run.add_argument("--csv",    default="inventory.csv",      help="Intermediate CSV path")
     run.add_argument("--output", default="architecture.drawio", help="Output .drawio file")
     # ── Pump onboarding push (fork addition) ──
@@ -102,6 +120,13 @@ def main():
         from pump_aws_radar.billing import main as bil_main
         sys.argv = _rebuild_argv("billing", args)
         bil_main()
+
+    elif args.command == "org-checks":
+        from pump_aws_radar.org_checks import run_checks
+        run_checks(profile=args.profile, regions=args.region, output=args.output)
+        if args.upload_token:
+            print(f"\n── Uploading org checks to Pump ({args.api_base}) ──")
+            _upload_org_checks(args.api_base, args.upload_token, args.output, fatal=True)
 
     elif args.command == "diagram":
         from pump_aws_radar.drawio import main as dia_main
@@ -125,7 +150,7 @@ def _run(args):
         )
 
     drawing = args.diagram
-    total = 1 + (1 if uploading else 0) + (1 if drawing else 0)
+    total = 1 + (1 if args.org_checks else 0) + (1 if uploading else 0) + (1 if drawing else 0)
     step = 1
     # Step 1 — inventory (and billing, when --billing is set)
     print(f"── Step {step}/{total}: Running inventory ──")
@@ -150,6 +175,14 @@ def _run(args):
     sys.argv = inv_args
     inv_main()
 
+    if args.org_checks:
+        from pump_aws_radar.org_checks import run_checks
+
+        step += 1
+        print(f"\n── Step {step}/{total}: Organization migration checks ──")
+        regions = [args.region] if args.region and not args.all_regions else None
+        run_checks(profile=args.profile, regions=regions, output=args.org_checks_output)
+
     if uploading:
         # Push both CSVs to Pump
         from pump_aws_radar.upload import UploadError, upload_csvs
@@ -166,6 +199,10 @@ def _run(args):
         except UploadError as e:
             sys.exit(f"\nUpload failed: {e}")
         print("  ✓ Your inventory and billing data are on their way to Pump.")
+        if args.org_checks:
+            # Separate and non-fatal: inventory + billing already landed, and the
+            # analysis they start doesn't depend on the org checks.
+            _upload_org_checks(args.api_base, args.upload_token, args.org_checks_output, fatal=False)
 
     if drawing:
         # Draw the diagram. Runs on both paths — upload and non-upload — so a
@@ -179,6 +216,18 @@ def _run(args):
         print(f"  ✓ Open {args.output} at https://app.diagrams.net/")
 
     print("\n✓ Done!")
+
+
+def _upload_org_checks(api_base, token, csv_path, fatal):
+    from pump_aws_radar.upload import UploadError, upload_csvs
+
+    try:
+        upload_csvs(api_base=api_base, token=token, files={"org_checks": csv_path})
+    except UploadError as e:
+        message = f"Org checks upload failed: {e}"
+        if fatal:
+            sys.exit(f"\n{message}")
+        print(f"  [!] {message}\n      {csv_path} is still on disk; send it to your Pump contact.")
 
 
 # Dests whose False value is meaningful and so must be forwarded explicitly.

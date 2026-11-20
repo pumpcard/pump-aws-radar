@@ -32,7 +32,7 @@ _USER_AGENT = f"pump-aws-radar/{__version__}"
 _URLS_PATH = "/api/v1/estimate/radar/urls"
 
 # Roles the backend recognizes, mapped to the local CSV each one carries.
-_ROLES = ("inventory", "billing")
+_ROLES = ("inventory", "billing", "org_checks")
 
 _HTTP_TIMEOUT_SECONDS = 60
 
