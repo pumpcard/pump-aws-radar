@@ -307,7 +307,10 @@ def test_identity_center(monkeypatch):
     assert "Looks like TEAM" not in applications["Corp VPN"].detail
     assert "Looks like TEAM" not in applications["Data Team Portal"].detail
     assert "scim.okta.com" in by_check["external identity provider"][0].detail
-    assert all(finding.severity == FIX_BEFORE_MOVE for finding in checks.findings)
+    # Applications and an external IdP are on the do-not-touch list.
+    assert by_check["instance"][0].severity == FIX_BEFORE_MOVE
+    assert all(finding.severity == BLOCKER for finding in by_check["application"])
+    assert by_check["external identity provider"][0].severity == BLOCKER
 
 
 class _LocalUsersIdentityStore:
@@ -321,8 +324,30 @@ def test_identity_source_unknown_without_scim(monkeypatch):
     monkeypatch.setattr(checks, "client", lambda service, region=None: clients[service])
     checks.check_identity_center(REGION)
     [source] = [finding for finding in checks.findings if finding.check == "identity source"]
-    assert source.severity == REVIEW
+    assert source.severity == UNVERIFIED
     assert not [finding for finding in checks.findings if finding.check == "external identity provider"]
+
+
+class _EmptyIdentityStore:
+    def list_users(self, IdentityStoreId, NextToken=None):
+        return {"Users": []}
+
+
+def test_identity_store_without_users_is_not_undecided(monkeypatch):
+    clients = {"sso-admin": _FakeSsoAdmin(), "identitystore": _EmptyIdentityStore()}
+    checks = OrgChecks(session=None, regions=[REGION])
+    monkeypatch.setattr(checks, "client", lambda service, region=None: clients[service])
+    checks.check_identity_center(REGION)
+    [source] = _by_check(checks.findings, "identity source")
+    assert source.severity == INFO
+
+
+def test_identity_source_unknown_leaves_verdict_undecided():
+    findings = [
+        Finding(FIX_BEFORE_MOVE, "AWS IAM Identity Center", "instance"),
+        Finding(UNVERIFIED, "AWS IAM Identity Center", "identity source"),
+    ]
+    assert verdict(findings).startswith("Undecided: could not confirm AWS IAM Identity Center")
 
 
 # ── RAM (moto has no ListPrincipals or OTHER-ACCOUNTS, so a hand-written client) ──
@@ -375,16 +400,169 @@ def test_ram_shares(monkeypatch):
     checks.check_ram_shares(REGION)
 
     by_resource = {finding.resource: finding for finding in checks.findings}
-    assert set(by_resource) == {"subnets", "licenses", "by-account", "tgw"}
-    assert by_resource["subnets"].severity == FIX_BEFORE_MOVE
+    # RAM is on the do-not-touch list: every active share is a blocker.
+    assert set(by_resource) == {"subnets", "licenses", "by-account", "external-ok", "tgw"}
+    assert {finding.severity for finding in checks.findings} == {BLOCKER}
+    assert by_resource["subnets"].check == "org-scoped share"
     assert "ec2:Subnet ×2" in by_resource["subnets"].detail
     assert "can't create new ones" in by_resource["subnets"].detail
-    assert by_resource["licenses"].severity == FIX_BEFORE_MOVE
     assert "lose access" in by_resource["licenses"].detail
-    assert by_resource["by-account"].severity == REVIEW
-    # A consumed networking share might be org-scoped by its owner.
-    assert by_resource["tgw"].severity == FIX_BEFORE_MOVE
+    assert by_resource["by-account"].check == "account share"
+    assert "External principals are off" in by_resource["by-account"].detail
+    assert "External principals are off" not in by_resource["external-ok"].detail
     assert "222222222222" in by_resource["tgw"].detail
+    assert "networking" in by_resource["tgw"].detail
+
+
+class _FakeConfig:
+    def __init__(self, results):
+        self._results = results
+
+    def select_aggregate_resource_config(self, Expression, ConfigurationAggregatorName, Limit, NextToken=None):
+        assert "AWS::RAM::ResourceShare" in Expression
+        return {"Results": [json.dumps(result) for result in self._results]}
+
+
+def test_member_ram_shares_from_aggregator():
+    checks = OrgChecks(session=None, regions=[REGION])
+    checks.caller_account_id = "111111111111"
+    found = checks._query_member_ram_shares(_FakeConfig([
+        {"accountId": "222222222222", "awsRegion": REGION, "resourceName": "net-share", "configuration": {"status": "ACTIVE"}},
+        {"accountId": "222222222222", "awsRegion": REGION, "resourceName": "old", "configuration": {"status": "DELETED"}},
+        {"accountId": "111111111111", "awsRegion": REGION, "resourceName": "mine", "configuration": {"status": "ACTIVE"}},
+    ]), "org-aggregator")
+    assert found
+    assert [(finding.severity, finding.account_id, finding.resource) for finding in checks.findings] == [
+        (BLOCKER, "222222222222", "net-share"),
+    ]
+
+
+@pytest.mark.parametrize(("org_sharing", "severity"), [(False, REVIEW), (True, UNVERIFIED), (None, UNVERIFIED)])
+def test_member_ram_shares_unseen(org_sharing, severity):
+    checks = OrgChecks(session=None, regions=[REGION])
+    checks.ram_org_sharing_enabled = org_sharing
+    checks._report_member_ram_shares(found_any=False)
+    [finding] = checks.findings
+    assert finding.severity == severity
+    assert finding.service == "AWS Resource Access Manager"
+    if severity == UNVERIFIED:
+        assert verdict(checks.findings).startswith("Undecided")
+
+
+# ── closed accounts, delegated admins (hand-written Organizations client) ──
+
+class _FakeOrganizations:
+    def describe_organization(self):
+        return {"Organization": {"Id": "o-abc", "MasterAccountId": "111111111111"}}
+
+    def list_accounts(self, NextToken=None):
+        return {"Accounts": [
+            {"Id": "111111111111", "Name": "management", "Status": "ACTIVE", "State": "ACTIVE"},
+            {"Id": "222222222222", "Name": "old-sandbox", "Status": "SUSPENDED", "State": "CLOSED"},
+            {"Id": "333333333333", "Name": "closing", "Status": "PENDING_CLOSURE"},
+        ]}
+
+    def list_delegated_administrators(self, NextToken=None):
+        return {"DelegatedAdministrators": [{"Id": "444444444444", "Name": "migration"}]}
+
+    def list_delegated_services_for_account(self, AccountId, NextToken=None):
+        return {"DelegatedServices": [
+            {"ServicePrincipal": "mgn.amazonaws.com"},
+            {"ServicePrincipal": "guardduty.amazonaws.com"},
+        ]}
+
+
+def test_closed_accounts_are_blockers(monkeypatch):
+    checks = OrgChecks(session=None, regions=[REGION])
+    monkeypatch.setattr(checks, "client", lambda service, region=None: _FakeOrganizations())
+    checks.caller_account_id = "111111111111"
+    checks.check_organization()
+    closed = {finding.account_id: finding for finding in _by_check(checks.findings, "closed account")}
+    assert set(closed) == {"222222222222", "333333333333"}
+    assert {finding.severity for finding in closed.values()} == {BLOCKER}
+    assert "closed" in closed["222222222222"].detail
+    assert "pending closure" in closed["333333333333"].detail
+    assert checks.org_account_ids == {"111111111111"}
+
+
+def test_application_migration_delegated_admin_is_a_blocker(monkeypatch):
+    checks = OrgChecks(session=None, regions=[REGION])
+    monkeypatch.setattr(checks, "client", lambda service, region=None: _FakeOrganizations())
+    checks.check_delegated_administrators()
+    by_principal = {finding.resource: finding for finding in checks.findings}
+    assert by_principal["mgn.amazonaws.com"].severity == BLOCKER
+    assert by_principal["mgn.amazonaws.com"].service == "AWS Application Migration Service"
+    assert by_principal["guardduty.amazonaws.com"].severity == FIX_BEFORE_MOVE
+
+
+# ── Application Migration Service ──
+
+class _FakeMgn:
+    def __init__(self, servers=None, uninitialized=False):
+        self._servers = servers or []
+        self._uninitialized = uninitialized
+
+    def describe_source_servers(self, filters, nextToken=None):
+        if self._uninitialized:
+            raise ClientError({"Error": {"Code": "UninitializedAccountException", "Message": ""}}, "DescribeSourceServers")
+        assert filters == {"isArchived": False}
+        return {"items": self._servers}
+
+
+def test_application_migration_source_servers(monkeypatch):
+    mgn = _FakeMgn([{"lifeCycle": {"state": "READY_FOR_TEST"}}, {"lifeCycle": {"state": "CUTOVER"}}])
+    checks = OrgChecks(session=None, regions=[REGION])
+    monkeypatch.setattr(checks, "client", lambda service, region=None: mgn)
+    checks.check_application_migration(REGION)
+    [finding] = checks.findings
+    assert finding.severity == BLOCKER
+    assert "2 source servers" in finding.detail
+    assert "READY_FOR_TEST ×1" in finding.detail
+
+
+@pytest.mark.parametrize("mgn", [_FakeMgn(), _FakeMgn(uninitialized=True)])
+def test_application_migration_not_in_use(monkeypatch, mgn):
+    checks = OrgChecks(session=None, regions=[REGION])
+    monkeypatch.setattr(checks, "client", lambda service, region=None: mgn)
+    checks.check_application_migration(REGION)
+    assert checks.findings == []
+
+
+# ── EDP / PPA ──
+
+class _FakeCostExplorer:
+    def __init__(self, record_types):
+        self._record_types = record_types
+        self.calls = []
+
+    def get_dimension_values(self, TimePeriod, Dimension, NextPageToken=None):
+        self.calls.append((TimePeriod, Dimension))
+        return {"DimensionValues": [{"Value": value} for value in self._record_types]}
+
+
+@pytest.mark.parametrize(("record_types", "severity", "resource"), [
+    (["Usage", "Tax", "Enterprise Discount Program Discount"], BLOCKER, "EDP"),
+    (["Usage", "Private Rate Card Discount", "Enterprise Discount Program Discount"], BLOCKER, "EDP, PPA"),
+    (["Usage", "Credit", "Solution Provider Program Discount"], INFO, ""),
+])
+def test_private_pricing(monkeypatch, record_types, severity, resource):
+    cost_explorer = _FakeCostExplorer(record_types)
+    checks = OrgChecks(session=None, regions=[REGION])
+    monkeypatch.setattr(checks, "client", lambda service, region=None: cost_explorer)
+    checks.check_private_pricing()
+    [finding] = checks.findings
+    assert finding.severity == severity
+    assert finding.resource == resource
+    assert cost_explorer.calls[0][1] == "RECORD_TYPE"
+
+
+def test_private_pricing_unreadable_leaves_verdict_undecided(monkeypatch):
+    checks = OrgChecks(session=None, regions=[REGION])
+    monkeypatch.setattr(checks, "client", lambda service, region=None: _DeniedClient(service))
+    checks.check_private_pricing()
+    [finding] = checks.findings
+    assert finding.severity == UNVERIFIED
+    assert verdict(checks.findings).startswith("Undecided: could not confirm EDP / PPA")
 
 
 # ── failure handling ──

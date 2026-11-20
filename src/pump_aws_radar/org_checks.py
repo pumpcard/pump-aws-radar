@@ -8,8 +8,10 @@ and join one Pump provisions through Ingram, and writes one CSV row per finding.
 
 Each finding has a severity that decides the onboarding path:
 
-    blocker              the move would break something we can't prepare for
-                         (e.g. Control Tower) — CTA onboarding, route to sales
+    blocker              on the "do not touch, auto CTA" list (Control Tower, closed
+                         accounts, Identity Center applications or external IdP,
+                         RAM shares, Application Migration Service, EDP/PPA) —
+                         CTA onboarding, route to sales
     fix_before_move      breaks unless changed before the accounts leave
                          (org-scoped RAM shares, aws:PrincipalOrgID conditions, ...)
     reenable_after_move  stops on the move and has to be turned on again in the
@@ -37,6 +39,7 @@ import urllib.parse
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from dataclasses import astuple, dataclass
+from datetime import date, timedelta
 
 try:
     import boto3
@@ -106,6 +109,29 @@ CONTROL_TOWER_ROLE_NAMES = {
     "AWSControlTowerConfigAggregatorRoleForOrganizations",
 }
 
+# Services on the "DO NOT TOUCH - AUTO CTA" list in the "Automated Migration
+# Checks" doc. Finding any of them in use is a blocker; failing to check one of
+# them leaves the verdict undecided rather than "regular onboarding".
+CONTROL_TOWER = "AWS Control Tower"
+IDENTITY_CENTER = "AWS IAM Identity Center"
+RAM = "AWS Resource Access Manager"
+APPLICATION_MIGRATION = "AWS Application Migration Service"
+PRIVATE_PRICING = "EDP / PPA"
+AUTO_CTA_SERVICES = {CONTROL_TOWER, IDENTITY_CENTER, RAM, APPLICATION_MIGRATION, PRIVATE_PRICING}
+
+# Account states for a closed account (Status is the older field, State the newer one).
+CLOSED_ACCOUNT_STATES = {"SUSPENDED", "PENDING_CLOSURE", "CLOSED"}
+
+# Cost Explorer RECORD_TYPE values for private pricing agreements.
+PRIVATE_PRICING_RECORD_TYPES = {
+    "Enterprise Discount Program Discount": "EDP",
+    "Private Rate Card Discount": "PPA",
+}
+PRIVATE_PRICING_LOOKBACK_DAYS = 365
+
+# Delegated administrators for these services are blockers, not just a deregistration step.
+DELEGATED_ADMIN_BLOCKERS = {"mgn.amazonaws.com", "ram.amazonaws.com"}
+
 # Trusted-access service principals mapped to the doc's guidance
 # ("Automated Migration Checks"). Anything not listed falls back to
 # reenable_after_move: the doc's default for an org-integrated service is
@@ -113,15 +139,21 @@ CONTROL_TOWER_ROLE_NAMES = {
 TRUSTED_ACCESS_RULES = {
     "controltower.amazonaws.com": (
         BLOCKER,
-        "AWS Control Tower",
+        CONTROL_TOWER,
         "Control Tower manages the accounts from the management account and breaks when they leave.",
         "Route to sales: the customer needs to keep access to their management account (CTA onboarding).",
     ),
     "mgn.amazonaws.com": (
-        REVIEW,
-        "AWS Application Migration Service",
+        BLOCKER,
+        APPLICATION_MIGRATION,
         "Application Migration Service is integrated with the organization.",
-        "Edge case: talk to sales/SA before choosing the onboarding path.",
+        "Route to sales: Application Migration Service is on the do-not-touch list (CTA onboarding).",
+    ),
+    "ram.amazonaws.com": (
+        REVIEW,
+        RAM,
+        "RAM sharing with the organization is enabled, so accounts can share resources with the whole org or with OUs.",
+        "See the RAM rows: any share in use means CTA onboarding.",
     ),
     "account.amazonaws.com": (
         INFO,
@@ -131,7 +163,7 @@ TRUSTED_ACCESS_RULES = {
     ),
     "sso.amazonaws.com": (
         FIX_BEFORE_MOVE,
-        "AWS IAM Identity Center",
+        IDENTITY_CENTER,
         "Identity Center is integrated with the organization; SSO access to moved accounts stops when they leave.",
         "Recreate users, groups and permission sets in the new org; make sure every account has an IAM user or role the customer can reach without SSO.",
     ),
@@ -249,6 +281,8 @@ class OrgChecks:
         # Set by check_control_tower; other checks use it to decide whether Control
         # Tower traces (its stack sets, its IAM roles) are already covered.
         self.control_tower_found = False
+        # Set by check_trusted_access. None means trusted access could not be read.
+        self.ram_org_sharing_enabled = None
         self._bucket_names_listed = False
         self._bucket_names = None
         self._bucket_names_lock = threading.Lock()
@@ -340,6 +374,7 @@ class OrgChecks:
             self.check_delegated_administrators()
             self.check_control_tower()
             self.check_org_policies()
+            self.check_private_pricing()
 
         regions = self.regions()
         regional_checks = [
@@ -348,6 +383,7 @@ class OrgChecks:
             self.check_ram_shares,
             self.check_identity_center,
             self.check_observability_links,
+            self.check_application_migration,
         ]
         with ThreadPoolExecutor(max_workers=self.max_workers) as pool:
             futures = [pool.submit(self.check_management_account_iam), pool.submit(self.check_management_account_buckets)]
@@ -365,7 +401,8 @@ class OrgChecks:
                 "Not checked by this scan: org conditions in resource policies on SSM parameters, KMS keys, "
                 "SNS topics, SQS queues, Lambda functions, EventBridge buses, Secrets Manager secrets, ECR "
                 "repositories and Backup vaults; AMIs and snapshots shared with an org or OU; CloudTrail Lake "
-                "organization event data stores; Application Migration Service set up without trusted access; "
+                "organization event data stores; Application Migration Service used in member accounts without "
+                "trusted access; "
                 "third-party integrations through S3 notifications or log subscription filters."
             ),
             action="Cover these with the customer on the AE checklist.",
@@ -424,6 +461,19 @@ class OrgChecks:
         with self.guard("AWS Organizations", "accounts"):
             accounts = list(paginate(organizations.list_accounts, "Accounts"))
             self.org_account_ids = {account["Id"] for account in accounts if account.get("Status") == "ACTIVE"}
+            for account in accounts:
+                state = account.get("State") or account.get("Status", "")
+                if state not in CLOSED_ACCOUNT_STATES:
+                    continue
+                self.add(Finding(
+                    severity=BLOCKER,
+                    service="AWS Organizations",
+                    check="closed account",
+                    account_id=account["Id"],
+                    resource=account.get("Name", account["Id"]),
+                    detail=f"Account is {state.lower().replace('_', ' ')}. Closed accounts are on the do-not-touch list.",
+                    action="Route to sales (CTA onboarding).",
+                ))
             self.add(Finding(
                 severity=INFO,
                 service="AWS Organizations",
@@ -439,6 +489,9 @@ class OrgChecks:
             enabled = list(paginate(
                 organizations.list_aws_service_access_for_organization, "EnabledServicePrincipals"
             ))
+            self.ram_org_sharing_enabled = any(
+                service_access["ServicePrincipal"] == "ram.amazonaws.com" for service_access in enabled
+            )
             for service_access in enabled:
                 principal = service_access["ServicePrincipal"]
                 severity, service, detail, action = TRUSTED_ACCESS_RULES.get(principal, (
@@ -469,14 +522,19 @@ class OrgChecks:
                 ))
                 for delegated in services:
                     principal = delegated["ServicePrincipal"]
+                    is_blocker = principal in DELEGATED_ADMIN_BLOCKERS
                     self.add(Finding(
-                        severity=FIX_BEFORE_MOVE,
+                        severity=BLOCKER if is_blocker else FIX_BEFORE_MOVE,
                         service=TRUSTED_ACCESS_RULES.get(principal, (None, principal))[1],
                         check="delegated administrator",
                         account_id=admin["Id"],
                         resource=principal,
                         detail=f"{admin.get('Name', admin['Id'])} is delegated administrator for {principal}.",
-                        action="Deregister before the move; register the account again in the new org.",
+                        action=(
+                            "Route to sales: this service is on the do-not-touch list (CTA onboarding)."
+                            if is_blocker else
+                            "Deregister before the move; register the account again in the new org."
+                        ),
                     ))
 
     def check_control_tower(self):
@@ -494,7 +552,7 @@ class OrgChecks:
         report those as blockers when no landing zone was found here.
         """
         controltower = self.client("controltower")
-        with self.guard("AWS Control Tower", "landing zone"):
+        with self.guard(CONTROL_TOWER, "landing zone"):
             landing_zones = list(paginate(controltower.list_landing_zones, "landingZones", token_in="nextToken"))
             for landing_zone in landing_zones:
                 self.control_tower_found = True
@@ -505,7 +563,7 @@ class OrgChecks:
                 )["landingZone"]
                 self.add(Finding(
                     severity=BLOCKER,
-                    service="AWS Control Tower",
+                    service=CONTROL_TOWER,
                     check="landing zone",
                     account_id=self.caller_account_id,
                     region=home_region,
@@ -539,6 +597,41 @@ class OrgChecks:
                         action="Recreate it in the new org if the customer still wants it enforced.",
                     ))
 
+    def check_private_pricing(self):
+        """EDP or PPA discounts on the bill in the last year."""
+        cost_explorer = self.client("ce")
+        end = date.today()
+        start = end - timedelta(days=PRIVATE_PRICING_LOOKBACK_DAYS)
+        with self.guard(PRIVATE_PRICING, "discount record types"):
+            record_types = [
+                value["Value"] for value in paginate(
+                    cost_explorer.get_dimension_values, "DimensionValues", token_in="NextPageToken",
+                    TimePeriod={"Start": start.isoformat(), "End": end.isoformat()}, Dimension="RECORD_TYPE",
+                )
+            ]
+            agreements = sorted(
+                PRIVATE_PRICING_RECORD_TYPES[record_type]
+                for record_type in record_types if record_type in PRIVATE_PRICING_RECORD_TYPES
+            )
+            if agreements:
+                self.add(Finding(
+                    severity=BLOCKER,
+                    service=PRIVATE_PRICING,
+                    check="private pricing agreement",
+                    account_id=self.caller_account_id,
+                    resource=", ".join(agreements),
+                    detail=f"The bill carries {' and '.join(agreements)} discounts since {start.isoformat()}.",
+                    action="Route to sales: EDP / PPA is on the do-not-touch list (CTA onboarding).",
+                ))
+            else:
+                self.add(Finding(
+                    severity=INFO,
+                    service=PRIVATE_PRICING,
+                    check="private pricing agreement",
+                    account_id=self.caller_account_id,
+                    detail=f"No EDP or PPA discounts on the bill since {start.isoformat()}.",
+                ))
+
     # ── StackSets ──
 
     def check_stack_sets(self, region):
@@ -566,7 +659,7 @@ class OrgChecks:
                     else:
                         self.add(Finding(
                             severity=BLOCKER,
-                            service="AWS Control Tower",
+                            service=CONTROL_TOWER,
                             check="control tower stack set",
                             account_id=self.caller_account_id,
                             region=region,
@@ -720,23 +813,23 @@ class OrgChecks:
     def check_ram_shares(self, region):
         ram = self.client("ram", region)
         owned = []
-        with self.guard("AWS Resource Access Manager", "owned shares", region):
+        with self.guard(RAM, "owned shares", region):
             owned = list(paginate(
                 ram.get_resource_shares, "resourceShares", token_in="nextToken",
                 resourceOwner="SELF", resourceShareStatus="ACTIVE",
             ))
         for share in owned:
-            with self.guard("AWS Resource Access Manager", "owned share", region, share.get("name", "")):
+            with self.guard(RAM, "owned share", region, share.get("name", "")):
                 self._check_owned_share(ram, region, share)
 
         consumed = []
-        with self.guard("AWS Resource Access Manager", "consumed shares", region):
+        with self.guard(RAM, "consumed shares", region):
             consumed = list(paginate(
                 ram.get_resource_shares, "resourceShares", token_in="nextToken",
                 resourceOwner="OTHER-ACCOUNTS", resourceShareStatus="ACTIVE",
             ))
         for share in consumed:
-            with self.guard("AWS Resource Access Manager", "consumed share", region, share.get("name", "")):
+            with self.guard(RAM, "consumed share", region, share.get("name", "")):
                 share_arn = share["resourceShareArn"]
                 resources = list(paginate(
                     ram.list_resources, "resources", token_in="nextToken",
@@ -744,18 +837,21 @@ class OrgChecks:
                 ))
                 types = _type_counts(resource["type"] for resource in resources)
                 networking = any(is_network_resource_type(resource["type"]) for resource in resources)
+                impact = (
+                    "Includes networking resources, which can mean downtime. " if networking else ""
+                )
                 self.add(Finding(
-                    severity=FIX_BEFORE_MOVE if networking else REVIEW,
-                    service="AWS Resource Access Manager",
+                    severity=BLOCKER,
+                    service=RAM,
                     check="consumed share",
                     account_id=self.caller_account_id,
                     region=region,
                     resource=share.get("name", share_arn),
                     detail=(
                         f"Shared with this account by {share.get('owningAccountId', '?')}: {types or 'no resources'}. "
-                        "If the owner shared it with the org or an OU, access ends on the move."
+                        f"{impact}If the owner shared it with the org or an OU, access ends on the move."
                     ),
-                    action="Ask the owner to share it with explicit account IDs (external principals allowed) before the move.",
+                    action="Route to sales: RAM is on the do-not-touch list (CTA onboarding).",
                 ))
 
     def _check_owned_share(self, ram, region, share):
@@ -779,46 +875,42 @@ class OrgChecks:
         name = share.get("name", share_arn)
 
         if org_principals:
+            check = "org-scoped share"
             impact = (
                 "Networking resources: workloads in moved accounts keep existing ENIs/attachments "
                 "but can't create new ones in the shared subnet or TGW."
                 if networking else
                 "Moved accounts lose access to these resources immediately."
             )
-            self.add(Finding(
-                severity=FIX_BEFORE_MOVE,
-                service="AWS Resource Access Manager",
-                check="org-scoped share",
-                account_id=self.caller_account_id,
-                region=region,
-                resource=name,
-                detail=f"Shared with {', '.join(org_principals)}: {types or 'no resources'}. {impact}",
-                action=(
-                    "Before the move, share with the explicit account IDs instead (turn on external "
-                    "principals); switch back to org sharing in the new org afterwards if wanted."
-                ),
-            ))
-        elif account_principals and not allows_external:
-            self.add(Finding(
-                severity=REVIEW,
-                service="AWS Resource Access Manager",
-                check="account share without external principals",
-                account_id=self.caller_account_id,
-                region=region,
-                resource=name,
-                detail=(
-                    f"Shared with {len(account_principals)} accounts or IAM principals: {types or 'no resources'}. "
-                    "External principals are off, so once the accounts are in another org they "
-                    "are outside this share's allowed principals."
-                ),
-                action="Turn on external principals for this share before the move.",
-            ))
+            shared_with = ", ".join(org_principals)
+        else:
+            check = "account share"
+            impact = (
+                "External principals are off, so once the accounts are in another org they are "
+                "outside this share's allowed principals."
+                if account_principals and not allows_external else
+                "Shared with explicit principals."
+            )
+            shared_with = f"{len(account_principals)} accounts or IAM principals"
+            if not principals:
+                impact = "No principals are associated with it right now."
+                shared_with = "no one"
+        self.add(Finding(
+            severity=BLOCKER,
+            service=RAM,
+            check=check,
+            account_id=self.caller_account_id,
+            region=region,
+            resource=name,
+            detail=f"Shared with {shared_with}: {types or 'no resources'}. {impact}",
+            action="Route to sales: RAM is on the do-not-touch list (CTA onboarding).",
+        ))
 
     # ── IAM Identity Center ──
 
     def check_identity_center(self, region):
         sso_admin = self.client("sso-admin", region)
-        with self.guard("AWS IAM Identity Center", "instances", region):
+        with self.guard(IDENTITY_CENTER, "instances", region):
             instances = list(paginate(sso_admin.list_instances, "Instances"))
             for instance in instances:
                 self._check_identity_center_instance(sso_admin, region, instance)
@@ -830,7 +922,7 @@ class OrgChecks:
         permission_sets = list(paginate(sso_admin.list_permission_sets, "PermissionSets", InstanceArn=instance_arn))
         self.add(Finding(
             severity=FIX_BEFORE_MOVE,
-            service="AWS IAM Identity Center",
+            service=IDENTITY_CENTER,
             check="instance",
             account_id=instance.get("OwnerAccountId", self.caller_account_id),
             region=region,
@@ -843,7 +935,7 @@ class OrgChecks:
             ),
         ))
 
-        with self.guard("AWS IAM Identity Center", "applications", region):
+        with self.guard(IDENTITY_CENTER, "applications", region):
             applications = list(paginate(sso_admin.list_applications, "Applications", InstanceArn=instance_arn))
             for application in applications:
                 name = application.get("Name", application.get("ApplicationArn", ""))
@@ -856,18 +948,18 @@ class OrgChecks:
                 if looks_like_team:
                     detail += " Looks like TEAM, which also relies on Account Management delegated admin."
                 self.add(Finding(
-                    severity=FIX_BEFORE_MOVE,
-                    service="AWS IAM Identity Center",
+                    severity=BLOCKER,
+                    service=IDENTITY_CENTER,
                     check="application",
                     account_id=instance.get("OwnerAccountId", self.caller_account_id),
                     region=region,
                     resource=name,
                     detail=detail,
-                    action="Find out what it is (VPN, third-party app, TEAM) and plan to reconfigure it by hand in the new org.",
+                    action="Route to sales: Identity Center applications are on the do-not-touch list (CTA onboarding).",
                 ))
 
         if identity_store_id:
-            with self.guard("AWS IAM Identity Center", "identity source", region):
+            with self.guard(IDENTITY_CENTER, "identity source", region):
                 identity_store = self.client("identitystore", region)
                 users = list(paginate(identity_store.list_users, "Users", IdentityStoreId=identity_store_id))
                 external_issuers = sorted({
@@ -877,24 +969,34 @@ class OrgChecks:
                 })
                 if external_issuers:
                     self.add(Finding(
-                        severity=FIX_BEFORE_MOVE,
-                        service="AWS IAM Identity Center",
+                        severity=BLOCKER,
+                        service=IDENTITY_CENTER,
                         check="external identity provider",
                         account_id=instance.get("OwnerAccountId", self.caller_account_id),
                         region=region,
                         resource=identity_store_id,
                         detail=f"Users are provisioned from an external IdP (SCIM issuer: {', '.join(external_issuers)}).",
                         action=(
-                            "The customer reconfigures SAML metadata and SCIM between their IdP "
-                            "(Okta, Google Workspace, Entra, Rippling, ...) and the new org; send them the migration doc."
+                            "Route to sales: an external identity provider is on the do-not-touch list "
+                            "(CTA onboarding); the customer would have to reconfigure SAML and SCIM themselves."
                         ),
+                    ))
+                elif not users:
+                    self.add(Finding(
+                        severity=INFO,
+                        service=IDENTITY_CENTER,
+                        check="identity source",
+                        account_id=instance.get("OwnerAccountId", self.caller_account_id),
+                        region=region,
+                        resource=identity_store_id,
+                        detail="The identity store has no users, so no one signs in through Identity Center.",
                     ))
                 else:
                     # SAML without SCIM leaves no ExternalIds, and there is no public
                     # API for the identity source, so absence proves nothing.
                     self.add(Finding(
-                        severity=REVIEW,
-                        service="AWS IAM Identity Center",
+                        severity=UNVERIFIED,
+                        service=IDENTITY_CENTER,
                         check="identity source",
                         account_id=instance.get("OwnerAccountId", self.caller_account_id),
                         region=region,
@@ -903,8 +1005,42 @@ class OrgChecks:
                             f"None of the {len(users)} users were provisioned through SCIM. The identity "
                             "source can't be read through the API, so an external IdP over SAML alone is still possible."
                         ),
-                        action="Ask whether they sign in through Okta, Google Workspace, Entra, Rippling or similar.",
+                        action=(
+                            "Ask whether they sign in through Okta, Google Workspace, Entra, Rippling or "
+                            "similar; if they do, it is CTA onboarding."
+                        ),
                     ))
+
+    # ── Application Migration Service ──
+
+    def check_application_migration(self, region):
+        """Source servers replicating into this account. Regions where the service was never
+        set up answer UninitializedAccountException."""
+        mgn = self.client("mgn", region)
+        with self.guard(APPLICATION_MIGRATION, "source servers", region):
+            try:
+                servers = list(paginate(
+                    mgn.describe_source_servers, "items", token_in="nextToken", filters={"isArchived": False},
+                ))
+            except ClientError as error:
+                if error.response.get("Error", {}).get("Code") == "UninitializedAccountException":
+                    return
+                raise
+            if not servers:
+                return
+            states = _type_counts(
+                server.get("lifeCycle", {}).get("state", "UNKNOWN") for server in servers
+            )
+            self.add(Finding(
+                severity=BLOCKER,
+                service=APPLICATION_MIGRATION,
+                check="source servers",
+                account_id=self.caller_account_id,
+                region=region,
+                resource=f"{len(servers)} source servers",
+                detail=f"Application Migration Service has {len(servers)} source servers that are not archived ({states}).",
+                action="Route to sales: Application Migration Service is on the do-not-touch list (CTA onboarding).",
+            ))
 
     # ── CloudWatch cross-account observability ──
 
@@ -987,7 +1123,7 @@ class OrgChecks:
             if control_tower_roles and not self.control_tower_found:
                 self.add(Finding(
                     severity=BLOCKER,
-                    service="AWS Control Tower",
+                    service=CONTROL_TOWER,
                     check="control tower roles",
                     account_id=self.caller_account_id,
                     resource=", ".join(sorted(control_tower_roles)),
@@ -1062,9 +1198,10 @@ class OrgChecks:
                 break
 
         not_scanned = (
-            "IAM trust and resource policies with org conditions in member accounts, RAM shares "
-            "owned by member accounts, and CloudWatch observability sinks in member accounts"
+            "IAM trust and resource policies with org conditions in member accounts, and CloudWatch "
+            "observability sinks in member accounts (RAM shares have their own row)"
         )
+        member_ram_shares_found = False
         if not aggregator:
             if lookup_errors:
                 errors = ", ".join(f"{region}: {code}" for region, code in sorted(lookup_errors.items()))
@@ -1079,6 +1216,7 @@ class OrgChecks:
                 detail=f"{reason}, so these were not scanned: {not_scanned}."[:1000],
                 action="Ask the customer (or the AE checklist) whether member accounts use aws:PrincipalOrgID or org-scoped RAM shares.",
             ))
+            self._report_member_ram_shares(member_ram_shares_found)
             return
 
         name = aggregator["ConfigurationAggregatorName"]
@@ -1121,10 +1259,12 @@ class OrgChecks:
                         },
                         region=item.get("awsRegion", ""),
                     )
+            member_ram_shares_found = self._query_member_ram_shares(config, name)
             query_completed = True
 
         if not query_completed:
             # The guard already wrote an unverified row with the error.
+            self._report_member_ram_shares(member_ram_shares_found)
             return
         missing = sorted(self.org_account_ids - accounts_seen - {self.caller_account_id})
         self.add(Finding(
@@ -1147,13 +1287,76 @@ class OrgChecks:
                 detail=f"{len(missing)} accounts have no IAM or S3 resources in the aggregator: {', '.join(missing[:50])}.",
                 action="Check these accounts by hand.",
             ))
+        self._report_member_ram_shares(member_ram_shares_found)
+
+    def _query_member_ram_shares(self, config, aggregator_name) -> bool:
+        """RAM shares owned by member accounts, as far as Config records them. Returns whether any were found."""
+        found = False
+        results = paginate(
+            config.select_aggregate_resource_config, "Results",
+            Expression=(
+                "SELECT accountId, awsRegion, resourceId, resourceName, configuration "
+                "WHERE resourceType = 'AWS::RAM::ResourceShare'"
+            ),
+            ConfigurationAggregatorName=aggregator_name, Limit=100,
+        )
+        for raw in results:
+            item = json.loads(raw)
+            account_id = item.get("accountId", "")
+            if account_id == self.caller_account_id:
+                # Already scanned directly.
+                continue
+            configuration = item.get("configuration") or {}
+            status = configuration.get("status", "ACTIVE") if isinstance(configuration, dict) else "ACTIVE"
+            if status != "ACTIVE":
+                continue
+            found = True
+            self.add(Finding(
+                severity=BLOCKER,
+                service=RAM,
+                check="member account share",
+                account_id=account_id,
+                region=item.get("awsRegion", ""),
+                resource=item.get("resourceName") or item.get("resourceId", ""),
+                detail="RAM share owned by a member account (found through the Config aggregator).",
+                action="Route to sales: RAM is on the do-not-touch list (CTA onboarding).",
+            ))
+        return found
+
+    def _report_member_ram_shares(self, found_any):
+        """Say how much of member-account RAM sharing this scan could see."""
+        if found_any:
+            return
+        seen_from_management = (
+            "Shares a member account made with the whole org show up above as consumed by the "
+            "management account; shares with OUs or with specific accounts don't."
+        )
+        if self.ram_org_sharing_enabled is False:
+            self.add(Finding(
+                severity=REVIEW,
+                service=RAM,
+                check="member account shares",
+                account_id=self.caller_account_id,
+                detail=(
+                    "RAM sharing with the organization is off, so no account can share with the org or an OU. "
+                    "Member accounts can still share with specific accounts, which this scan can't see."
+                ),
+                action="Ask whether member accounts share resources with each other through RAM; if they do, it is CTA onboarding.",
+            ))
+            return
         self.add(Finding(
             severity=UNVERIFIED,
-            service="Member accounts",
-            check="member account RAM shares",
+            service=RAM,
+            check="member account shares",
             account_id=self.caller_account_id,
-            detail="RAM shares owned by member accounts (often a networking account sharing subnets or a TGW) were not scanned.",
-            action="Ask whether a networking account shares subnets or Transit Gateways with the org or OUs.",
+            detail=(
+                "RAM sharing with the organization is on (or could not be read), and RAM shares owned by "
+                f"member accounts can't be listed from the management account. {seen_from_management}"
+            ),
+            action=(
+                "Ask whether any account (often a networking account) shares subnets, Transit Gateways or "
+                "other resources through RAM; if it does, it is CTA onboarding."
+            ),
         ))
 
 
@@ -1170,18 +1373,18 @@ def verdict(findings: list[Finding]) -> str:
     suffix = f" {unverified} checks could not run; see the unverified rows." if unverified else ""
     if BLOCKER in severities:
         return "CTA onboarding: at least one blocker (route to sales)." + suffix
-    blocker_unknown = any(
-        finding.severity == UNVERIFIED and (
-            finding.service == "AWS Control Tower"
-            or (finding.service == "AWS Organizations" and finding.check == "organization")
+    unknown = sorted({
+        finding.service for finding in findings
+        if finding.severity == UNVERIFIED and (
+            finding.service in AUTO_CTA_SERVICES
+            or (finding.service == "AWS Organizations" and finding.check in ("organization", "accounts"))
         )
-        for finding in findings
-    )
-    if blocker_unknown:
+    })
+    if unknown:
         return (
-            "Undecided: could not confirm whether Control Tower is in use (or could not read the org "
-            "from the management account). Rerun with controltower:ListLandingZones and "
-            "controltower:GetLandingZone, from the management account." + suffix
+            f"Undecided: could not confirm {', '.join(unknown)}, any of which means CTA onboarding. "
+            "Settle the unverified rows for these (rerun with the missing permissions from the "
+            "management account, or ask the customer)." + suffix
         )
     if FIX_BEFORE_MOVE in severities or REVIEW in severities:
         return "Regular onboarding after prep: fix the fix_before_move rows and go through the review rows first." + suffix

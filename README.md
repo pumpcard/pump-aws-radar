@@ -63,10 +63,23 @@ Resource, Detail, Action) and prints a verdict:
 
 | Found | Verdict |
 |---|---|
-| any `blocker` (e.g. Control Tower) | CTA onboarding — route to sales |
-| Control Tower or the org could not be read | Undecided — rerun with the permissions below |
+| any `blocker` | CTA onboarding — route to sales |
+| an unverified row for a blocker service | Undecided — rerun with the permissions below, or ask the customer |
 | `fix_before_move` or `review` rows | Regular onboarding after prep |
 | only `reenable_after_move` rows | Regular onboarding; turn those back on in the new org |
+
+Blockers are the services on the "do not touch, auto CTA" list:
+
+- Control Tower (landing zone, its stack sets or its IAM roles)
+- closed or closing accounts in the organization
+- IAM Identity Center applications, and users provisioned from an external identity provider (SCIM)
+- any active RAM share (owned or consumed), and a RAM delegated administrator
+- Application Migration Service (trusted access, delegated administrator, or source servers in the management account)
+- EDP or PPA discounts on the bill in the last 12 months (Cost Explorer `RECORD_TYPE`)
+
+Identity Center without SCIM users and RAM shares owned by member accounts can't be confirmed
+from the management account, so they come out unverified and the verdict stays undecided until
+someone asks the customer.
 
 ### Permissions
 
