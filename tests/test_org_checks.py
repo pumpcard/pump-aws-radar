@@ -275,6 +275,9 @@ class _FakeSsoAdmin:
     def list_permission_sets(self, InstanceArn, NextToken=None):
         return {"PermissionSets": ["ps-1", "ps-2"]}
 
+    def list_accounts_for_provisioned_permission_set(self, InstanceArn, PermissionSetArn, NextToken=None):
+        return {"AccountIds": {"ps-1": ["222222222222"], "ps-2": ["222222222222", "333333333333"]}[PermissionSetArn]}
+
     def list_applications(self, InstanceArn, NextToken=None):
         return {"Applications": [
             {"Name": "Corp VPN", "ApplicationProviderArn": "arn:aws:sso::aws:applicationProvider/custom"},
@@ -311,6 +314,7 @@ def test_identity_center(monkeypatch):
     assert by_check["instance"][0].severity == FIX_BEFORE_MOVE
     assert all(finding.severity == BLOCKER for finding in by_check["application"])
     assert by_check["external identity provider"][0].severity == BLOCKER
+    assert checks.identity_center_accounts == {"222222222222", "333333333333"}
 
 
 class _LocalUsersIdentityStore:
@@ -639,3 +643,114 @@ def test_csv_neutralizes_formulas(tmp_path):
     path = tmp_path / "org_checks.csv"
     org_checks.write_csv([Finding(REVIEW, "RAM", "share", resource="=HYPERLINK(1)")], str(path))
     assert "'=HYPERLINK(1)" in path.read_text()
+
+
+# ── account access after the move ──
+
+@pytest.mark.parametrize(("arn", "kind"), [
+    ("arn:aws:sts::111111111111:assumed-role/AWSReservedSSO_Admin_abc/jane", "an Identity Center user"),
+    ("arn:aws:iam::111111111111:root", "the root user"),
+    ("arn:aws:iam::111111111111:user/ops", "an IAM user"),
+    ("arn:aws:sts::111111111111:assumed-role/Deploy/session", "an assumed IAM role"),
+])
+def test_caller_kind(arn, kind):
+    assert org_checks._caller_kind(arn) == kind
+
+
+class _FakeIam:
+    def __init__(self, root_password=False, console_users=(), features=()):
+        self._root_password = root_password
+        self._console_users = set(console_users)
+        self._features = list(features)
+
+    def list_organizations_features(self):
+        return {"EnabledFeatures": self._features}
+
+    def get_account_summary(self):
+        return {"SummaryMap": {"AccountPasswordPresent": int(self._root_password)}}
+
+    def list_users(self, Marker=None):
+        return {"Users": [{"UserName": "ops"}, {"UserName": "ci"}], "IsTruncated": False}
+
+    def get_login_profile(self, UserName):
+        if UserName not in self._console_users:
+            raise ClientError({"Error": {"Code": "NoSuchEntity", "Message": ""}}, "GetLoginProfile")
+        return {"LoginProfile": {"UserName": UserName}}
+
+
+ORG_ACCOUNTS = [
+    {"Id": "111111111111", "Name": "management", "Status": "ACTIVE", "JoinedMethod": "CREATED"},
+    {"Id": "222222222222", "Name": "created", "Status": "ACTIVE", "JoinedMethod": "CREATED"},
+    {"Id": "333333333333", "Name": "invited", "Status": "ACTIVE", "JoinedMethod": "INVITED"},
+    {"Id": "444444444444", "Name": "no-sso", "Status": "ACTIVE", "JoinedMethod": "INVITED"},
+    {"Id": "555555555555", "Name": "closed", "Status": "SUSPENDED", "JoinedMethod": "CREATED"},
+]
+
+
+def _access_checks(monkeypatch, iam, identity_center_accounts=frozenset({"222222222222", "333333333333"}), instances=1):
+    checks = OrgChecks(session=None, regions=[REGION])
+    monkeypatch.setattr(checks, "client", lambda service, region=None: iam)
+    checks.caller_account_id = "111111111111"
+    checks.caller_arn = "arn:aws:sts::111111111111:assumed-role/AWSReservedSSO_Admin_abc/jane"
+    checks.org_id = "o-abc"
+    checks.org_accounts = ORG_ACCOUNTS
+    checks.identity_center_instances = instances
+    checks.identity_center_accounts = None if identity_center_accounts is None else set(identity_center_accounts)
+    checks.check_account_access()
+    access = {finding.account_id: finding.resource for finding in _by_check(checks.findings, "access after move")}
+    [summary] = _by_check(checks.findings, "lockout risk")
+    return access, summary
+
+
+def test_access_with_a_management_login(monkeypatch):
+    access, summary = _access_checks(monkeypatch, _FakeIam(console_users={"ops"}, features=["RootCredentialsManagement"]))
+    assert access == {
+        "222222222222": "identity_center_recoverable",
+        "333333333333": "identity_center_only",
+        "444444444444": "not_identity_center",
+    }
+    assert summary.severity == FIX_BEFORE_MOVE
+    assert "1 IAM users have console passwords (ops)" in summary.detail
+    assert "member root credentials may have been deleted" in summary.detail
+    assert "an Identity Center user" in summary.detail
+
+
+def test_access_without_a_management_login(monkeypatch):
+    access, summary = _access_checks(monkeypatch, _FakeIam())
+    # With no way into the old management account, a created account is no better off.
+    assert access["222222222222"] == "identity_center_only"
+    assert "no root password and no IAM user" in summary.detail
+
+
+def test_access_unknown_when_assignments_unreadable(monkeypatch):
+    access, summary = _access_checks(monkeypatch, _FakeIam(root_password=True), identity_center_accounts=None)
+    assert set(access.values()) == {"unknown"}
+    assert summary.severity == FIX_BEFORE_MOVE
+
+
+def test_no_identity_center_no_lockout_risk(monkeypatch):
+    access, summary = _access_checks(monkeypatch, _FakeIam(), identity_center_accounts=set(), instances=0)
+    assert access == {}
+    assert summary.severity == INFO
+
+
+class _IamTrustedAccessOff(_FakeIam):
+    def list_organizations_features(self):
+        raise ClientError({"Error": {"Code": "ServiceAccessNotEnabledException", "Message": ""}}, "ListOrganizationsFeatures")
+
+
+def test_centralized_root_access_off_without_iam_trusted_access(monkeypatch):
+    _, summary = _access_checks(monkeypatch, _IamTrustedAccessOff(root_password=True))
+    assert "Centralized root access: off." in summary.detail
+
+
+def test_unreadable_identity_center_is_not_reported_as_absent(monkeypatch):
+    checks = OrgChecks(session=None, regions=[REGION])
+    checks.add(Finding(UNVERIFIED, "AWS IAM Identity Center", "instances", detail="AccessDenied"))
+    monkeypatch.setattr(checks, "client", lambda service, region=None: _FakeIam())
+    checks.caller_account_id = "111111111111"
+    checks.org_accounts = ORG_ACCOUNTS
+    checks.check_account_access()
+    [summary] = _by_check(checks.findings, "lockout risk")
+    assert summary.severity == FIX_BEFORE_MOVE
+    assert {finding.resource for finding in _by_check(checks.findings, "access after move")} == {"unknown"}

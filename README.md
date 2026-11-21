@@ -81,6 +81,24 @@ Identity Center without SCIM users and RAM shares owned by member accounts can't
 from the management account, so they come out unverified and the verdict stays undecided until
 someone asks the customer.
 
+### Account access after the move
+
+Identity Center sign-in to a member account stops when the account leaves the org. If that is
+the only way in, the customer is locked out until Identity Center is rebuilt. The scan writes
+one `access after move` row per active member account, with one of these in the Resource column:
+
+| Resource | Meaning |
+|---|---|
+| `identity_center_only` | Identity Center reaches it, and radar sees no other way in (invited account, or the old management account has no login outside Identity Center) |
+| `identity_center_recoverable` | Identity Center reaches it, Organizations created it, and the old management account has a root password or an IAM user with a console password, so `OrganizationAccountAccessRole` should be a way back in (the role itself can't be checked from here) |
+| `not_identity_center` | No Identity Center permission set is provisioned there |
+| `unknown` | Identity Center assignments could not be read |
+
+A `lockout risk` row for the org is `fix_before_move` when any account is in the first, second
+or fourth group. Its detail covers the management account's logins, centralized root access and
+who ran the scan. IAM users and root passwords in member accounts can't be read from the
+management account; Pump's role in each account has to check those.
+
 ### Permissions
 
 Everything is read-only. The AWS-managed `ReadOnlyAccess` policy covers every call except

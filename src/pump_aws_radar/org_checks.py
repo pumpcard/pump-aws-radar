@@ -129,6 +129,17 @@ PRIVATE_PRICING_RECORD_TYPES = {
 }
 PRIVATE_PRICING_LOOKBACK_DAYS = 365
 
+# Rows about whether the customer's people can still get into accounts after the move.
+# Not on the do-not-touch list, so a failed check here does not make the verdict undecided.
+ACCOUNT_ACCESS = "Account access"
+
+# Values of the Resource column on "access after move" rows, one per member account.
+# The backend can read these to hold an account's removal until there is a verified way in.
+ACCESS_IDENTITY_CENTER_ONLY = "identity_center_only"
+ACCESS_IDENTITY_CENTER_RECOVERABLE = "identity_center_recoverable"
+ACCESS_NOT_IDENTITY_CENTER = "not_identity_center"
+ACCESS_UNKNOWN = "unknown"
+
 # Delegated administrators for these services are blockers, not just a deregistration step.
 DELEGATED_ADMIN_BLOCKERS = {"mgn.amazonaws.com", "ram.amazonaws.com"}
 
@@ -283,6 +294,14 @@ class OrgChecks:
         self.control_tower_found = False
         # Set by check_trusted_access. None means trusted access could not be read.
         self.ram_org_sharing_enabled = None
+        self.caller_arn = ""
+        # Every account in the org, from ListAccounts: Id, Name, Status, JoinedMethod.
+        self.org_accounts: list[dict] = []
+        # Accounts with an Identity Center permission set provisioned. None until read, so a
+        # failed read is told apart from "no assignments".
+        self.identity_center_instances = 0
+        self.identity_center_accounts: set[str] | None = None
+        self._identity_center_lock = threading.Lock()
         self._bucket_names_listed = False
         self._bucket_names = None
         self._bucket_names_lock = threading.Lock()
@@ -364,7 +383,9 @@ class OrgChecks:
     # ── entry point ──
 
     def run(self):
-        self.caller_account_id = self.client("sts").get_caller_identity()["Account"]
+        identity = self.client("sts").get_caller_identity()
+        self.caller_account_id = identity["Account"]
+        self.caller_arn = identity.get("Arn", "")
         self.check_organization()
         if not self.has_organization:
             return self.findings
@@ -392,6 +413,8 @@ class OrgChecks:
                 future.result()
 
         self.check_member_accounts(regions)
+        if self.is_management_account:
+            self.check_account_access()
         self.add(Finding(
             severity=UNVERIFIED,
             service="Scan scope",
@@ -460,6 +483,7 @@ class OrgChecks:
 
         with self.guard("AWS Organizations", "accounts"):
             accounts = list(paginate(organizations.list_accounts, "Accounts"))
+            self.org_accounts = accounts
             self.org_account_ids = {account["Id"] for account in accounts if account.get("Status") == "ACTIVE"}
             for account in accounts:
                 state = account.get("State") or account.get("Status", "")
@@ -920,6 +944,17 @@ class OrgChecks:
         identity_store_id = instance.get("IdentityStoreId")
 
         permission_sets = list(paginate(sso_admin.list_permission_sets, "PermissionSets", InstanceArn=instance_arn))
+        with self._identity_center_lock:
+            self.identity_center_instances += 1
+        with self.guard(ACCOUNT_ACCESS, "identity center accounts", region, instance_arn):
+            covered = set()
+            for permission_set in permission_sets:
+                covered.update(paginate(
+                    sso_admin.list_accounts_for_provisioned_permission_set, "AccountIds",
+                    InstanceArn=instance_arn, PermissionSetArn=permission_set,
+                ))
+            with self._identity_center_lock:
+                self.identity_center_accounts = (self.identity_center_accounts or set()) | covered
         self.add(Finding(
             severity=FIX_BEFORE_MOVE,
             service=IDENTITY_CENTER,
@@ -1041,6 +1076,161 @@ class OrgChecks:
                 detail=f"Application Migration Service has {len(servers)} source servers that are not archived ({states}).",
                 action="Route to sales: Application Migration Service is on the do-not-touch list (CTA onboarding).",
             ))
+
+    # ── account access after the move ──
+
+    def check_account_access(self):
+        """Whether the customer's people can still get into each account after it moves.
+
+        Identity Center access to a member account is an AWSReservedSSO_* role that Identity
+        Center removes when the account leaves the org. If that is the only way in (no IAM
+        user with a console password, no usable root login), the customer is locked out
+        until Identity Center is rebuilt in the new org.
+
+        Member-account IAM users and root passwords can't be read from the management
+        account, so per-account results say what radar could see and no more.
+        """
+        caller_kind = _caller_kind(self.caller_arn)
+        self.add(Finding(
+            severity=INFO,
+            service=ACCOUNT_ACCESS,
+            check="scan identity",
+            account_id=self.caller_account_id,
+            resource=self.caller_arn,
+            detail=f"The scan ran as {caller_kind}.",
+        ))
+
+        iam = self.client("iam")
+        root_features = None
+        with self.guard(ACCOUNT_ACCESS, "centralized root access"):
+            try:
+                root_features = iam.list_organizations_features().get("EnabledFeatures", [])
+            except ClientError as error:
+                # Centralized root access needs IAM trusted access; without it the feature is off.
+                if error.response.get("Error", {}).get("Code") != "ServiceAccessNotEnabledException":
+                    raise
+                root_features = []
+
+        root_password = None
+        with self.guard(ACCOUNT_ACCESS, "management account root password"):
+            root_password = bool(iam.get_account_summary()["SummaryMap"].get("AccountPasswordPresent"))
+
+        console_users = None
+        with self.guard(ACCOUNT_ACCESS, "management account console users"):
+            names = [user["UserName"] for page in iam_paginate(iam.list_users) for user in page.get("Users", [])]
+            with ThreadPoolExecutor(max_workers=self.max_workers) as pool:
+                has_password = list(pool.map(lambda name: _has_login_profile(iam, name), names))
+            console_users = [name for name, present in zip(names, has_password) if present]
+
+        # The old management account is a way back into accounts Organizations created:
+        # their OrganizationAccountAccessRole trusts it, with no org condition.
+        management_login = bool(root_password) or bool(console_users)
+        if root_password is None or console_users is None:
+            management_login_text = "could not be fully read"
+        elif management_login:
+            parts = []
+            if root_password:
+                parts.append("the root user has a password")
+            if console_users:
+                parts.append(f"{len(console_users)} IAM users have console passwords ({', '.join(console_users[:10])})")
+            management_login_text = "; ".join(parts)
+        else:
+            management_login_text = "no root password and no IAM user with a console password"
+
+        identity_center_unreadable = any(
+            finding.severity == UNVERIFIED and finding.service == IDENTITY_CENTER and finding.check == "instances"
+            for finding in self.findings
+        )
+        if identity_center_unreadable:
+            # Instances could not be listed somewhere, so assignments are unknown too.
+            self.identity_center_accounts = None
+        if not self.identity_center_instances and not identity_center_unreadable:
+            self.add(Finding(
+                severity=INFO,
+                service=ACCOUNT_ACCESS,
+                check="lockout risk",
+                account_id=self.caller_account_id,
+                resource=self.org_id,
+                detail="No Identity Center instance, so no account loses Identity Center sign-in on the move.",
+            ))
+            return
+
+        counts = {
+            ACCESS_IDENTITY_CENTER_ONLY: 0,
+            ACCESS_IDENTITY_CENTER_RECOVERABLE: 0,
+            ACCESS_NOT_IDENTITY_CENTER: 0,
+            ACCESS_UNKNOWN: 0,
+        }
+        at_risk = []
+        for account in self.org_accounts:
+            account_id = account["Id"]
+            if account_id == self.caller_account_id or account.get("Status") != "ACTIVE":
+                continue
+            joined = account.get("JoinedMethod", "")
+            if self.identity_center_accounts is None:
+                access = ACCESS_UNKNOWN
+                detail = "Identity Center assignments could not be read."
+            elif account_id not in self.identity_center_accounts:
+                access = ACCESS_NOT_IDENTITY_CENTER
+                detail = "No Identity Center permission set is provisioned here. How people sign in can't be read from the management account."
+            elif joined == "CREATED" and management_login:
+                access = ACCESS_IDENTITY_CENTER_RECOVERABLE
+                detail = (
+                    "Identity Center sign-in stops on the move. Organizations created this account, so its "
+                    "OrganizationAccountAccessRole should trust the old management account, which has a login "
+                    "outside Identity Center. Whether the role still exists can't be read from here."
+                )
+            else:
+                access = ACCESS_IDENTITY_CENTER_ONLY
+                why = (
+                    "It was invited, so it has no OrganizationAccountAccessRole"
+                    if joined == "INVITED" else
+                    "The old management account has no login outside Identity Center to come back through"
+                )
+                detail = (
+                    f"Identity Center sign-in stops on the move. {why}. Unless an IAM user with a console "
+                    "password or the root login works, nobody can get in until Identity Center is rebuilt."
+                )
+            counts[access] += 1
+            if access != ACCESS_NOT_IDENTITY_CENTER:
+                at_risk.append(account_id)
+            self.add(Finding(
+                severity=INFO,
+                service=ACCOUNT_ACCESS,
+                check="access after move",
+                account_id=account_id,
+                resource=access,
+                detail=f"{account.get('Name', account_id)} (joined: {joined.lower() or 'unknown'}). {detail}",
+            ))
+
+        root_text = (
+            "could not be read" if root_features is None else
+            f"on ({', '.join(root_features)}): member root credentials may have been deleted"
+            if root_features else "off"
+        )
+        self.add(Finding(
+            severity=FIX_BEFORE_MOVE if at_risk else INFO,
+            service=ACCOUNT_ACCESS,
+            check="lockout risk",
+            account_id=self.caller_account_id,
+            resource=self.org_id,
+            detail=(
+                f"Identity Center covers accounts that lose that sign-in on the move: "
+                f"{counts[ACCESS_IDENTITY_CENTER_ONLY]} with no other way in that radar can see, "
+                f"{counts[ACCESS_IDENTITY_CENTER_RECOVERABLE]} reachable through OrganizationAccountAccessRole "
+                f"from the old management account, {counts[ACCESS_UNKNOWN]} unknown; "
+                f"{counts[ACCESS_NOT_IDENTITY_CENTER]} have no Identity Center assignment. "
+                f"Management account login outside Identity Center: {management_login_text}. "
+                f"Centralized root access: {root_text}. The scan ran as {caller_kind}. "
+                "Whether root password recovery works after an account leaves the org is not verified."
+            )[:1500],
+            action=(
+                "Before any listed account leaves: the customer confirms root email access (or an IAM user "
+                "with a console password) for each one, and exports Identity Center users, groups, permission "
+                "sets and assignments. Member-account IAM can't be read by radar; check it with Pump's role "
+                "in each account."
+            ) if at_risk else "",
+        ))
 
     # ── CloudWatch cross-account observability ──
 
@@ -1358,6 +1548,29 @@ class OrgChecks:
                 "other resources through RAM; if it does, it is CTA onboarding."
             ),
         ))
+
+
+def _has_login_profile(iam, user_name: str) -> bool:
+    """Whether an IAM user has a console password."""
+    try:
+        iam.get_login_profile(UserName=user_name)
+    except ClientError as error:
+        if error.response.get("Error", {}).get("Code") == "NoSuchEntity":
+            return False
+        raise
+    return True
+
+
+def _caller_kind(arn: str) -> str:
+    if ":assumed-role/AWSReservedSSO_" in arn:
+        return "an Identity Center user"
+    if arn.endswith(":root"):
+        return "the root user"
+    if ":user/" in arn:
+        return "an IAM user"
+    if ":assumed-role/" in arn:
+        return "an assumed IAM role"
+    return "an unknown identity"
 
 
 def _type_counts(types) -> str:
