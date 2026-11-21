@@ -47,6 +47,74 @@ pump-aws-radar run --billing --upload-token <TOKEN> --api-base http://localhost:
 PUMP_API_BASE=http://localhost:8001 pump-aws-radar run --billing --upload-token <TOKEN>
 ```
 
+## Organization migration checks
+
+Checks what breaks if the organization's accounts move to another AWS Organization.
+Run it from the **management account**:
+
+```bash
+pump-aws-radar org-checks --profile <management-account-profile>
+# or as part of a full run
+pump-aws-radar run --all-regions --tags --billing --org-checks --upload-token <TOKEN>
+```
+
+It writes `org_checks.csv` (one row per finding: Severity, Service, Check, AccountID, Region,
+Resource, Detail, Action) and prints a verdict:
+
+| Found | Verdict |
+|---|---|
+| any `blocker` | CTA onboarding — route to sales |
+| an unverified row for a blocker service | Undecided — rerun with the permissions below, or ask the customer |
+| `fix_before_move` or `review` rows | Regular onboarding after prep |
+| only `reenable_after_move` rows | Regular onboarding; turn those back on in the new org |
+
+Blockers are the services on the "do not touch, auto CTA" list:
+
+- Control Tower (landing zone, its stack sets or its IAM roles)
+- closed or closing accounts in the organization
+- IAM Identity Center applications, and users provisioned from an external identity provider (SCIM)
+- any active RAM share (owned or consumed), and a RAM delegated administrator
+- Application Migration Service (trusted access, delegated administrator, or source servers in the management account)
+- EDP or PPA discounts on the bill in the last 12 months (Cost Explorer `RECORD_TYPE`)
+
+Identity Center without SCIM users and RAM shares owned by member accounts can't be confirmed
+from the management account, so they come out unverified and the verdict stays undecided until
+someone asks the customer.
+
+### Account access after the move
+
+Identity Center sign-in to a member account stops when the account leaves the org. If that is
+the only way in, the customer is locked out until Identity Center is rebuilt. The scan writes
+one `access after move` row per active member account, with one of these in the Resource column:
+
+| Resource | Meaning |
+|---|---|
+| `identity_center_only` | Identity Center reaches it, and radar sees no other way in (invited account, or the old management account has no login outside Identity Center) |
+| `identity_center_recoverable` | Identity Center reaches it, Organizations created it, and the old management account has a root password or an IAM user with a console password, so `OrganizationAccountAccessRole` should be a way back in (the role itself can't be checked from here) |
+| `not_identity_center` | No Identity Center permission set is provisioned there |
+| `unknown` | Identity Center assignments could not be read |
+
+A `lockout risk` row for the org is `fix_before_move` when any account is in the first, second
+or fourth group. Its detail covers the management account's logins, centralized root access and
+who ran the scan. IAM users and root passwords in member accounts can't be read from the
+management account; Pump's role in each account has to check those.
+
+### Permissions
+
+Everything is read-only. The AWS-managed `ReadOnlyAccess` policy covers every call except
+Control Tower's. Add these two actions so the landing zone can be read directly:
+
+```json
+{"Effect": "Allow", "Action": ["controltower:ListLandingZones", "controltower:GetLandingZone"], "Resource": "*"}
+```
+
+Without them the scan still flags Control Tower from its IAM roles and its `AWSControlTowerBP-*`
+stack sets, and adds an unverified row for the landing zone.
+
+Member accounts are only scanned through an organization-wide AWS Config aggregator, if one
+exists in the management account. Everything the scan does not cover is listed in a
+`not covered` row in the CSV.
+
 ## How the push works
 
 `pump_aws_radar/upload.py`:
